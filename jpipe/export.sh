@@ -2,8 +2,9 @@
 # Regenerates every derived jPipe logo file from the two master SVGs:
 #   jpipe-logo.svg   (crest + wordmark)
 #   jpipe-picto.svg  (crest only)
-# Outputs: greyscale SVGs next to the masters, PDFs in pdf/, PNGs in png/.
-# Requires rsvg-convert (brew install librsvg) and python3.
+# Outputs: greyscale and one-ink SVGs next to the masters, PDFs in pdf/, PNGs in png/.
+# Requires rsvg-convert (brew install librsvg) and python3; the one-ink
+# step installs picosvg and skia-pathops into jpipe/.venv on first run.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -41,16 +42,67 @@ to_grey jpipe-logo.svg           jpipe-logo-bw.svg
 to_grey jpipe-picto.svg          jpipe-picto-bw.svg
 to_grey jpipe-picto-noborder.svg jpipe-picto-noborder-bw.svg
 
-PICTOS="jpipe-picto jpipe-picto-bw jpipe-picto-noborder jpipe-picto-noborder-bw"
+# One-ink SVG, for single-colour printing (screen print, embroidery, stamps,
+# engraving, vinyl cutting). Ink: the black linework, plus the J medallion
+# kept solid so the J still reads (knocked out). Every other fill is paper,
+# and paper is transparent, not white, so the mark prints in one ink on any
+# stock. The result is a single plain path, with no mask, clip or gradient, so
+# PDF exports and print tools keep it as vector. Getting there takes path
+# boolean operations, done with picosvg and skia-pathops in a local .venv.
+# The ink is black; change INK below for another colour. The pictogram is
+# built from the borderless one: its white halo would be paper anyway.
+VENV=.venv
+if [ ! -x "$VENV/bin/python" ]; then
+  python3 -m venv "$VENV"
+  "$VENV/bin/pip" install -q picosvg==0.23.0 skia-pathops==0.9.2
+fi
+
+to_one_ink() {
+  "$VENV/bin/python" -I - "$1" "$2" <<'EOF'
+import re, sys
+import pathops
+from picosvg.svg import SVG
+from picosvg.svg_pathops import skia_path, svg_commands
+from picosvg.svg_types import SVGPath
+src, dst = sys.argv[1], sys.argv[2]
+INK = '#000000'
+svg = open(src).read()
+# Highlight strips on the shield's lower facets overlap the black facet lines;
+# as paper they would notch those lines, so drop them.
+svg, n = re.subn(r'<path\s+id="path1(?:3[02468]|4[024])"[^>]*/>', '', svg)
+assert n == 8, f'expected 8 facet highlight paths in {src}, found {n}'
+# picosvg resolves transforms, clips and strokes into plain filled shapes,
+# in paint order. Replay them: ink shapes add to the ink area, paper shapes
+# cut it. Ink is black, or a gradient (only the medallion has one).
+pico = SVG.fromstring(svg).topicosvg(allow_text=False)
+ink = pathops.Path()
+for shape in pico.shapes():
+    fill = shape.fill.lower()
+    is_ink = fill.startswith('url(') or fill in ('#000000', '#000', 'black')
+    op = pathops.PathOp.UNION if is_ink else pathops.PathOp.DIFFERENCE
+    ink = pathops.op(ink, skia_path(shape.as_cmd_seq(), shape.fill_rule), op)
+d = SVGPath.from_commands(svg_commands(ink)).d
+vb = pico.view_box()
+open(dst, 'w').write(
+    '<svg xmlns="http://www.w3.org/2000/svg" '
+    f'viewBox="{vb.x:g} {vb.y:g} {vb.w:g} {vb.h:g}" width="{vb.w:g}" height="{vb.h:g}">'
+    f'<path fill="{INK}" d="{d}"/></svg>\n')
+EOF
+}
+
+to_one_ink jpipe-logo.svg           jpipe-logo-1ink.svg
+to_one_ink jpipe-picto-noborder.svg jpipe-picto-1ink.svg
+
+PICTOS="jpipe-picto jpipe-picto-bw jpipe-picto-noborder jpipe-picto-noborder-bw jpipe-picto-1ink"
 
 mkdir -p pdf png
-for name in jpipe-logo jpipe-logo-bw $PICTOS; do
+for name in jpipe-logo jpipe-logo-bw jpipe-logo-1ink $PICTOS; do
   rsvg-convert -f pdf "$name.svg" -o "pdf/$name.pdf"
 done
 
 # Logo (wide): sizes are widths. Pictogram (tall): sizes are heights.
 for w in 256 512 1024 2048; do
-  for name in jpipe-logo jpipe-logo-bw; do
+  for name in jpipe-logo jpipe-logo-bw jpipe-logo-1ink; do
     rsvg-convert -w "$w" "$name.svg" -o "png/$name-$w.png"
   done
 done
@@ -60,4 +112,4 @@ for h in 64 128 256 512 1024; do
   done
 done
 
-echo "Exported to $(pwd)/{pdf,png} and *-bw.svg"
+echo "Exported to $(pwd)/{pdf,png} and *-bw.svg, *-1ink.svg"
